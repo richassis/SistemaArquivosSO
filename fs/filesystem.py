@@ -1,14 +1,11 @@
-"""
-Logica do sistema de arquivos baseado em i-nodes: alocacao de blocos e
-i-nodes, leitura/escrita de conteudo, diretorios, links simbolicos e
-resolucao de caminhos absolutos/relativos.
-
-Observacao sobre permissoes: o i-node guarda o campo de permissoes (dono e
-outros - leitura, escrita, execucao), conforme exigido na estrutura do
-enunciado, mas nenhuma operacao aqui verifica ou aplica essa permissao.
-O controle de acesso em si (quem pode ou nao fazer o que) fica para o
-trabalho de Seguranca de SO do proximo bimestre. Ver README.md.
-"""
+# Logica do sistema de arquivos: alocacao de blocos/i-nodes, leitura e
+# escrita de conteudo, diretorios, links simbolicos e resolucao de
+# caminhos absolutos/relativos.
+#
+# Sobre permissoes: o i-node guarda o campo (dono/outros - rwx), que é
+# exigido pela estrutura do enunciado, mas nenhuma operacao aqui verifica
+# isso. O controle de acesso em si fica pro trabalho de Seguranca de SO do
+# proximo bimestre (ver README).
 
 from __future__ import annotations
 
@@ -65,9 +62,6 @@ class FileSystem:
 
         self.cwd_inode = self.sb.root_inode
 
-    # ------------------------------------------------------------------
-    # Formatacao / montagem
-    # ------------------------------------------------------------------
     def _mkfs(self) -> None:
         self.sb = SuperBlock(
             block_size=BLOCK_SIZE,
@@ -151,9 +145,7 @@ class FileSystem:
     def flush(self) -> None:
         self.disk.flush()
 
-    # ------------------------------------------------------------------
-    # Alocacao de i-nodes e blocos
-    # ------------------------------------------------------------------
+    # aloca/libera i-nodes e blocos usando os bitmaps
     def alloc_inode(self) -> int:
         idx = self.inode_bitmap.find_free()
         if idx is None:
@@ -189,9 +181,6 @@ class FileSystem:
         self._save_block_bitmap()
         self._save_superblock()
 
-    # ------------------------------------------------------------------
-    # Leitura/escrita de i-nodes
-    # ------------------------------------------------------------------
     def _inode_location(self, num: int) -> Tuple[int, int]:
         per_block = BLOCK_SIZE // INODE_SIZE
         block = self.sb.inode_table_start + num // per_block
@@ -209,9 +198,8 @@ class FileSystem:
         data[offset:offset + INODE_SIZE] = inode.pack()
         self.disk.write_block(block, bytes(data))
 
-    # ------------------------------------------------------------------
-    # Cadeia de blocos de um i-node (ponteiros diretos + i-node de continuacao)
-    # ------------------------------------------------------------------
+    # a partir daqui, funcoes que andam na cadeia de blocos de um i-node
+    # (ponteiros diretos + i-node de continuacao, se precisar)
     def _iter_blocks(self, head_inode_num: int) -> List[int]:
         blocks = []
         cur_num = head_inode_num
@@ -298,9 +286,8 @@ class FileSystem:
                 break
             cur_num, cur = nxt_num, nxt
 
-    # ------------------------------------------------------------------
-    # Conteudo de arquivos (usado tambem para o "conteudo" de symlinks)
-    # ------------------------------------------------------------------
+    # leitura/escrita do conteudo (usado tambem pro "conteudo" de symlinks,
+    # que e so o caminho de destino guardado como bytes)
     def read_data(self, head_inode_num: int) -> bytes:
         inode = self.read_inode(head_inode_num)
         size = inode.size
@@ -348,9 +335,6 @@ class FileSystem:
         """Libera todos os blocos de dados e i-nodes de continuacao (mas nao o i-node cabeca)."""
         self._shrink(head_inode_num, 0)
 
-    # ------------------------------------------------------------------
-    # Diretorios
-    # ------------------------------------------------------------------
     def _init_dir_block(self, block_num: int) -> None:
         blank = DirEntry.blank().pack()
         self.disk.write_block(block_num, blank * ENTRIES_PER_BLOCK)
@@ -414,10 +398,8 @@ class FileSystem:
                     return
         raise FSError(f"{name}: não encontrado")
 
-    # ------------------------------------------------------------------
-    # Permissoes (somente exibicao do campo do i-node; sem enforcement -- ver
-    # docstring do modulo)
-    # ------------------------------------------------------------------
+    # so formata o campo perm do i-node pra exibicao (ls/stat) -- sem
+    # checagem nenhuma, ver comentario la em cima do arquivo
     @staticmethod
     def perm_string(perm: int, itype: int) -> str:
         t = {TYPE_FILE: "-", TYPE_DIR: "d", TYPE_SYMLINK: "l"}.get(itype, "?")
@@ -427,9 +409,6 @@ class FileSystem:
             chars += ("rwx"[2 - (shift % 3)]) if bit else "-"
         return t + chars
 
-    # ------------------------------------------------------------------
-    # Nomes e caminhos
-    # ------------------------------------------------------------------
     @staticmethod
     def _check_name(name: str) -> None:
         if name in ("", ".", ".."):
@@ -528,9 +507,8 @@ class FileSystem:
             cur = entries.get("..", self.sb.root_inode)
         return maybe_ancestor == self.sb.root_inode
 
-    # ------------------------------------------------------------------
-    # Operacoes sobre arquivos
-    # ------------------------------------------------------------------
+    # ---- operacoes sobre arquivos ----
+
     def touch(self, path: str) -> int:
         parent, name = self.split_parent(path)
         existing = dict(self.read_dir_entries(parent))
@@ -661,9 +639,7 @@ class FileSystem:
         self.add_dir_entry(parent, name, num)
         return num
 
-    # ------------------------------------------------------------------
-    # Operacoes sobre diretorios
-    # ------------------------------------------------------------------
+    # e daqui pra baixo, diretorio
     def mkdir(self, path: str) -> int:
         parent, name = self.split_parent(path)
         existing = dict(self.read_dir_entries(parent))
@@ -720,9 +696,6 @@ class FileSystem:
             raise FSError(f"{path}: não é um diretório")
         self.cwd_inode = num
 
-    # ------------------------------------------------------------------
-    # Diagnostico / uso de disco
-    # ------------------------------------------------------------------
     def usage(self) -> dict:
         return {
             "total_blocks": self.sb.total_blocks,

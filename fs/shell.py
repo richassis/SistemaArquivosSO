@@ -42,7 +42,6 @@ class Shell:
         else:
             print(f"Disco existente montado em '{disk_path}'.")
 
-    # ------------------------------------------------------------------
     def run(self) -> None:
         print("Sistema de Arquivos baseado em i-nodes -- digite 'help' para ver os comandos.")
         while True:
@@ -80,7 +79,6 @@ class Shell:
         self.fs.close()
         print("Disco desmontado. Dados persistidos em", self.disk_path)
 
-    # ------------------------------------------------------------------
     def _dispatch(self, tokens) -> bool:
         cmd, args = tokens[0], tokens[1:]
         fs = self.fs
@@ -160,7 +158,6 @@ class Shell:
 
         return False
 
-    # ------------------------------------------------------------------
     def _echo(self, args) -> None:
         fs = self.fs
         if ">>" in args:
