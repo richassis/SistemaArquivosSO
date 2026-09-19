@@ -1,0 +1,59 @@
+USO DE INTELIGENCIA ARTIFICIAL NESTE TRABALHO
+================================================
+
+1. DEBUG E CORREÇÃO DE BUGS
+----------------------------
+A IA foi usada para ajudar a identificar e corrigir erros durante o
+desenvolvimento do sistema de arquivos (ex.: cálculo de layout do disco em
+fs/constants.py, manipulação de ponteiros/i-nodes e bitmaps em
+fs/filesystem.py, comandos do shell em fs/shell.py). O uso típico era
+descrever o sintoma do bug (comportamento incorreto, exceção, resultado
+inesperado ao rodar um comando do shell) e pedir ajuda para localizar a
+causa e sugerir uma correção, que era então revisada e aplicada
+manualmente.
+
+Exemplos de prompts usados:
+- "Esse comando está lançando erro X quando eu tento criar um arquivo
+  dentro de um subdiretório, por que isso acontece?"
+- "O bitmap de blocos não está liberando os blocos corretamente quando eu
+  removo um arquivo grande, ajuda a achar o problema."
+- "Por que o cálculo dos blocos de continuação (next_inode) não está batendo
+  para arquivos maiores que 16 KB?"
+
+2. DOCUMENTAÇÃO (README.md e ROTEIRO_DE_TESTES.md)
+----------------------------------------------------
+A IA foi usada como apoio na redação e organização do README.md (descrição
+do projeto, layout físico do disco, estrutura do i-node, comandos
+suportados etc.) e do ROTEIRO_DE_TESTES.md (roteiro de testes cobrindo as
+operações pedidas no enunciado). O conteúdo técnico (números, decisões de
+projeto, comportamento real do sistema) partiu do código e das decisões do
+aluno; a IA ajudou a estruturar, formatar em Markdown e deixar o texto mais
+claro.
+
+Exemplos de prompts usados:
+- "Me ajuda a organizar esses dados do layout do disco numa tabela em
+  Markdown para o README."
+- "Revisa esse texto do roteiro de testes e sugere uma ordem mais lógica
+  para os comandos."
+
+3. EXPLICAÇÕES CONCEITUAIS / DÚVIDAS
+--------------------------------------
+A IA foi usada para tirar dúvidas conceituais sobre sistemas de arquivos
+baseados em i-nodes durante o desenvolvimento, sem geração direta de
+código, tais como:
+
+- Diferenças entre ponteiros diretos, indiretos e o mecanismo de
+  encadeamento de i-nodes de continuação.
+- Como funciona a resolução de links simbólicos (soft links) e detecção de
+  loops.
+- Formas de representar entradas de diretório (nome + número do i-node) em
+  bytes fixos usando o módulo struct.
+
+O QUE NÃO FOI FEITO COM IA
+----------------------------
+- A arquitetura geral do sistema de arquivos e as decisões de projeto
+  (layout do disco, tamanho de i-node, mecanismo de continuação em vez de
+  blocos indiretos, etc.) foram definidas pelo grupo.
+- A IA não gerou a implementação completa de nenhum módulo do zero; sua
+  atuação se limitou a debug pontual, apoio à documentação e esclarecimento
+  de dúvidas conceituais, conforme descrito acima.
