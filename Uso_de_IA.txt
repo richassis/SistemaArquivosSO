@@ -27,7 +27,7 @@ do projeto, layout físico do disco, estrutura do i-node, comandos
 suportados etc.) e do ROTEIRO_DE_TESTES.md (roteiro de testes cobrindo as
 operações pedidas no enunciado). O conteúdo técnico (números, decisões de
 projeto, comportamento real do sistema) partiu do código e das decisões do
-aluno; a IA ajudou a estruturar, formatar em Markdown e deixar o texto mais
+grupo; a IA ajudou a estruturar, formatar em Markdown e deixar o texto mais
 claro.
 
 Exemplos de prompts usados:
