@@ -2,8 +2,10 @@
 # escrita de conteudo, diretorios, links simbolicos e resolucao de
 # caminhos absolutos/relativos.
 #
-# O i-node armazena as permissoes de acesso exigidas pelo trabalho.
-# A verificacao de permissoes sera tratada no trabalho de Seguranca.
+# Sobre permissoes: o i-node guarda o campo (dono/outros - rwx), que é
+# exigido pela estrutura do enunciado, mas nenhuma operacao aqui verifica
+# isso. O controle de acesso em si fica pro trabalho de Seguranca de SO do
+# proximo bimestre (ver README).
 
 from __future__ import annotations
 
@@ -21,7 +23,6 @@ from fs.constants import (
     DEFAULT_FILE_PERM,
     DEFAULT_SYMLINK_PERM,
     DIRECT_POINTERS,
-    INDIRECT_POINTERS_PER_BLOCK,
     DIRENT_SIZE,
     EMPTY_ENTRY,
     ENTRIES_PER_BLOCK,
@@ -215,95 +216,96 @@ class FileSystem:
         data[offset:offset + INODE_SIZE] = inode.pack()
         self.disk.write_block(block, bytes(data))
 
-    # Cada i-node possui 8 ponteiros diretos e um nono ponteiro indireto.
-    # O ponteiro indireto aponta para um bloco de 2048B contendo 512 enderecos
-    # de blocos de dados (512 inteiros de 32 bits).
-    def _read_indirect(self, block_num: int) -> List[int]:
-        raw = self.disk.read_block(block_num)
-        count = INDIRECT_POINTERS_PER_BLOCK
-        import struct
-        return list(struct.unpack(f"<{count}I", raw))
-
-    def _write_indirect(self, block_num: int, pointers: List[int]) -> None:
-        import struct
-        pointers = list(pointers[:INDIRECT_POINTERS_PER_BLOCK])
-        if len(pointers) < INDIRECT_POINTERS_PER_BLOCK:
-            pointers += [0] * (INDIRECT_POINTERS_PER_BLOCK - len(pointers))
-        self.disk.write_block(block_num, struct.pack(f"<{INDIRECT_POINTERS_PER_BLOCK}I", *pointers))
-
+    # a partir daqui, funcoes que andam na cadeia de blocos de um i-node
+    # (ponteiros diretos + i-node de continuacao, se precisar)
     def _iter_blocks(self, head_inode_num: int) -> List[int]:
-        inode = self.read_inode(head_inode_num)
-        blocks = [p for p in inode.pointers[:DIRECT_POINTERS] if p != 0]
-        indirect_block = inode.pointers[DIRECT_POINTERS]
-        if indirect_block != 0:
-            blocks.extend(p for p in self._read_indirect(indirect_block) if p != 0)
+        blocks = []
+        cur_num = head_inode_num
+        seen = set()
+        while cur_num != -1:
+            if cur_num in seen:
+                break  # protecao contra ciclo corrompido
+            seen.add(cur_num)
+            cur = self.read_inode(cur_num)
+            for p in cur.pointers:
+                if p == 0:
+                    break
+                blocks.append(p)
+            cur_num = cur.next_inode
         return blocks
 
     def _grow(self, head_inode_num: int, needed_blocks: int) -> None:
-        blocks = self._iter_blocks(head_inode_num)
-        if needed_blocks <= len(blocks):
-            return
-        if needed_blocks > DIRECT_POINTERS + INDIRECT_POINTERS_PER_BLOCK:
-            raise FSError("arquivo grande demais para um único i-node")
-
-        inode = self.read_inode(head_inode_num)
-        current = len(blocks)
-
-        # Preenche os ponteiros diretos.
-        while current < min(needed_blocks, DIRECT_POINTERS):
-            inode.pointers[current] = self.alloc_block()
-            current += 1
-        self.write_inode(head_inode_num, inode)
-
-        if needed_blocks <= DIRECT_POINTERS:
+        have = len(self._iter_blocks(head_inode_num))
+        to_add = needed_blocks - have
+        if to_add <= 0:
             return
 
-        # A partir daqui, usa um único bloco indireto. O próprio bloco
-        # indireto também ocupa um bloco da área de dados.
-        indirect_block = inode.pointers[DIRECT_POINTERS]
-        if indirect_block == 0:
-            indirect_block = self.alloc_block()
-            inode.pointers[DIRECT_POINTERS] = indirect_block
-            self.write_inode(head_inode_num, inode)
-            indirect = [0] * INDIRECT_POINTERS_PER_BLOCK
-        else:
-            indirect = self._read_indirect(indirect_block)
+        cur_num = head_inode_num
+        cur = self.read_inode(cur_num)
+        while cur.next_inode != -1:
+            cur_num = cur.next_inode
+            cur = self.read_inode(cur_num)
 
-        indirect_needed = needed_blocks - DIRECT_POINTERS
-        for i in range(indirect_needed):
-            if indirect[i] == 0:
-                indirect[i] = self.alloc_block()
-        self._write_indirect(indirect_block, indirect)
+        used_in_cur = 0
+        for p in cur.pointers:
+            if p == 0:
+                break
+            used_in_cur += 1
+
+        while to_add > 0:
+            if used_in_cur < DIRECT_POINTERS:
+                b = self.alloc_block()
+                cur.pointers[used_in_cur] = b
+                used_in_cur += 1
+                to_add -= 1
+            else:
+                new_num = self.alloc_inode()
+                new_inode = Inode(used=1, type=cur.type)
+                cur.next_inode = new_num
+                self.write_inode(cur_num, cur)  # persiste ponteiros + link para continuacao
+                cur_num, cur = new_num, new_inode
+                used_in_cur = 0
+        self.write_inode(cur_num, cur)
 
     def _shrink(self, head_inode_num: int, needed_blocks: int) -> None:
-        if needed_blocks < 0:
-            raise FSError("quantidade de blocos inválida")
-        inode = self.read_inode(head_inode_num)
-        current_blocks = self._iter_blocks(head_inode_num)
-        if needed_blocks >= len(current_blocks):
+        entries = []  # (inode_num, slot, block_num)
+        cur_num = head_inode_num
+        while cur_num != -1:
+            cur = self.read_inode(cur_num)
+            for slot, p in enumerate(cur.pointers):
+                if p == 0:
+                    break
+                entries.append((cur_num, slot, p))
+            cur_num = cur.next_inode
+
+        if len(entries) <= needed_blocks:
             return
 
-        keep_direct = min(needed_blocks, DIRECT_POINTERS)
-        for i in range(keep_direct, DIRECT_POINTERS):
-            if inode.pointers[i] != 0:
-                self.free_block(inode.pointers[i])
-                inode.pointers[i] = 0
+        to_free = entries[needed_blocks:]
+        touched = {}
+        for inode_num, slot, block_num in to_free:
+            self.free_block(block_num)
+            if inode_num not in touched:
+                touched[inode_num] = self.read_inode(inode_num)
+            touched[inode_num].pointers[slot] = 0
+        for inode_num, inode_obj in touched.items():
+            self.write_inode(inode_num, inode_obj)
 
-        indirect_block = inode.pointers[DIRECT_POINTERS]
-        if indirect_block != 0:
-            indirect = self._read_indirect(indirect_block)
-            keep_indirect = max(0, needed_blocks - DIRECT_POINTERS)
-            for i in range(keep_indirect, INDIRECT_POINTERS_PER_BLOCK):
-                if indirect[i] != 0:
-                    self.free_block(indirect[i])
-                    indirect[i] = 0
-            if keep_indirect == 0:
-                self.free_block(indirect_block)
-                inode.pointers[DIRECT_POINTERS] = 0
-            else:
-                self._write_indirect(indirect_block, indirect)
-
-        self.write_inode(head_inode_num, inode)
+        # remove i-nodes de continuacao que ficaram totalmente vazios no final da cadeia
+        cur_num = head_inode_num
+        cur = self.read_inode(cur_num)
+        while cur.next_inode != -1:
+            nxt_num = cur.next_inode
+            nxt = self.read_inode(nxt_num)
+            if all(p == 0 for p in nxt.pointers):
+                cur.next_inode = -1
+                self.write_inode(cur_num, cur)
+                while nxt_num != -1:  # libera nxt e todos os seguintes
+                    after = self.read_inode(nxt_num).next_inode
+                    self.free_inode(nxt_num)
+                    nxt_num = after
+                break
+            cur_num, cur = nxt_num, nxt
 
     # leitura/escrita do conteudo (usado tambem pro "conteudo" de symlinks,
     # que e so o caminho de destino guardado como bytes)

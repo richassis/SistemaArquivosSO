@@ -14,14 +14,12 @@ BLOCK_SIZE = 2048
 TOTAL_BLOCKS = DISK_SIZE // BLOCK_SIZE
 assert TOTAL_BLOCKS * BLOCK_SIZE == DISK_SIZE
 
-# i-node de tamanho fixo (128B): 8 ponteiros diretos e 1 ponteiro indireto.
-# O ponteiro indireto referencia um bloco com 512 enderecos de blocos de dados.
+# i-node de tamanho fixo, potencia de 2 (128B). 8 ponteiros diretos cobrem
+# 16KB por i-node; passou disso, encadeia em outro i-node via next_inode.
 DIRECT_POINTERS = 8
-INDIRECT_POINTERS_PER_BLOCK = BLOCK_SIZE // 4
-INODE_POINTERS = DIRECT_POINTERS + 1  # ultimo ponteiro aponta para um bloco indireto
-INODE_FORMAT = "<BBBB32s16s16sQdd9I"
+INODE_FORMAT = "<BBBB32s16s16sQdd8Ii"
 # used(B) type(B) perm(B) reservado(B) name(32s) creator(16s) owner(16s)
-# size(Q) created_at(d) modified_at(d) pointers(8I diretos + 1I indireto)
+# size(Q) created_at(d) modified_at(d) pointers(8I) next_inode(i)
 INODE_SIZE = struct.calcsize(INODE_FORMAT)
 assert INODE_SIZE == 128, INODE_SIZE
 assert (INODE_SIZE & (INODE_SIZE - 1)) == 0, "i-node precisa ter tamanho potencia de 2"
