@@ -2,8 +2,8 @@
 
 Este banco cobre as perguntas mais prováveis que o professor pode fazer
 sobre este trabalho, combinando (1) os requisitos explícitos do enunciado e
-(2) os conceitos do slide de aula "Sistemas de Arquivos" (Pedro de Botelho
-Marcos). As perguntas são genéricas — do tipo que ele poderia fazer para
+(2) os conceitos do slide de aula "Sistemas de Arquivos". 
+As perguntas são genéricas — do tipo que ele poderia fazer para
 qualquer grupo, não são "pegadinhas" específicas do nosso código — mas cada
 uma vem com um resumo de como responder **usando a nossa implementação**,
 com o arquivo/trecho de código onde a resposta está, para vocês
