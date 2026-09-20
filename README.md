@@ -47,12 +47,13 @@ Os 518 primeiros blocos (1036 KiB) são o espaço de gerenciamento; o restante
 
 Nome, criador, dono, tamanho, data de criação, data de modificação,
 permissões (3 bits do dono + 3 bits dos outros: r/w/x), 8 ponteiros diretos
-para blocos e `next_inode`. Além disso há um byte de "em uso" e um de tipo
+e 1 ponteiro indireto. Além disso há um byte de "em uso" e um de tipo
 (arquivo, diretório ou link simbólico).
 
-Quando o arquivo passa de 8 blocos (16 KiB), é alocado outro i-node de
-continuação e o `next_inode` do anterior aponta para ele, formando uma cadeia.
-Diretórios usam o mesmo mecanismo.
+Os 8 ponteiros diretos cobrem 16 KiB. O nono ponteiro aponta para um bloco
+de 2048 B que contém 512 endereços de blocos de dados. Assim, um i-node
+pode endereçar até 520 blocos de dados (1.064.960 B, aproximadamente 1,02 MiB).
+Diretórios usam a mesma estrutura de blocos.
 
 ## Diretórios e links
 
@@ -73,11 +74,12 @@ são gravados em binário com o módulo `struct`; não há JSON nem pickle.
 
 ## Decisões e limitações
 
-- **Nomes:** até 27 bytes (limite da entrada de diretório).
-- **Permissões:** o campo existe no i-node e é exibido pelo `ls`/`stat`, mas
-  nenhuma operação verifica as permissões e não há `chmod`.
+- **Nomes:** até 27 bytes em UTF-8 (limite da entrada de diretório).
+- **Permissões:** o i-node guarda permissões do dono e de outros usuários
+  (r/w/x). As operações de leitura, escrita, travessia de diretórios e
+  alterações na estrutura verificam essas permissões. Não há `chmod`.
 - **`mv` para um nome que já existe** retorna erro (não sobrescreve).
 - **`cp`** copia apenas arquivos, não diretórios.
-- **Número máximo de arquivos:** 8192 i-nodes (contando os de continuação).
+- **Número máximo de i-nodes:** 8192 (o sistema não cria i-nodes auxiliares para arquivos grandes).
 - **Diretório atual:** não é gravado no disco; cada execução começa em `/`.
   `rmdir` recusa remover o diretório em que o shell está.

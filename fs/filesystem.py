@@ -2,10 +2,8 @@
 # escrita de conteudo, diretorios, links simbolicos e resolucao de
 # caminhos absolutos/relativos.
 #
-# Sobre permissoes: o i-node guarda o campo (dono/outros - rwx), que é
-# exigido pela estrutura do enunciado, mas nenhuma operacao aqui verifica
-# isso. O controle de acesso em si fica pro trabalho de Seguranca de SO do
-# proximo bimestre (ver README).
+# As permissoes do i-node sao aplicadas usando dois grupos: dono e outros.
+# Nao ha grupos de usuarios neste trabalho.
 
 from __future__ import annotations
 
@@ -23,6 +21,7 @@ from fs.constants import (
     DEFAULT_FILE_PERM,
     DEFAULT_SYMLINK_PERM,
     DIRECT_POINTERS,
+    INDIRECT_POINTERS_PER_BLOCK,
     DIRENT_SIZE,
     EMPTY_ENTRY,
     ENTRIES_PER_BLOCK,
@@ -32,6 +31,9 @@ from fs.constants import (
     INODE_TABLE_START,
     MAX_NAME_LEN,
     NUM_INODES,
+    PERM_R,
+    PERM_W,
+    PERM_X,
     RESERVED_BLOCKS,
     ROOT_INODE,
     TOTAL_BLOCKS,
@@ -111,6 +113,24 @@ class FileSystem:
             self.sb = SuperBlock.unpack(sb_block)
         except ValueError as exc:
             raise FSError(f"imagem de disco invalida ou corrompida: {exc}") from exc
+
+        expected = {
+            "block_size": BLOCK_SIZE,
+            "total_blocks": TOTAL_BLOCKS,
+            "num_inodes": NUM_INODES,
+            "inode_size": INODE_SIZE,
+            "inode_bitmap_start": INODE_BITMAP_START,
+            "block_bitmap_start": BLOCK_BITMAP_START,
+            "inode_table_start": INODE_TABLE_START,
+            "data_start": DATA_START,
+            "root_inode": ROOT_INODE,
+        }
+        for field_name, expected_value in expected.items():
+            if getattr(self.sb, field_name) != expected_value:
+                raise FSError(
+                    f"imagem incompatível: {field_name}={getattr(self.sb, field_name)} "
+                    f"(esperado {expected_value})"
+                )
 
         ib = bytearray()
         for i in range(INODE_BITMAP_BLOCKS):
@@ -198,96 +218,95 @@ class FileSystem:
         data[offset:offset + INODE_SIZE] = inode.pack()
         self.disk.write_block(block, bytes(data))
 
-    # a partir daqui, funcoes que andam na cadeia de blocos de um i-node
-    # (ponteiros diretos + i-node de continuacao, se precisar)
+    # Cada i-node possui 8 ponteiros diretos e um nono ponteiro indireto.
+    # O ponteiro indireto aponta para um bloco de 2048B contendo 512 enderecos
+    # de blocos de dados (512 inteiros de 32 bits).
+    def _read_indirect(self, block_num: int) -> List[int]:
+        raw = self.disk.read_block(block_num)
+        count = INDIRECT_POINTERS_PER_BLOCK
+        import struct
+        return list(struct.unpack(f"<{count}I", raw))
+
+    def _write_indirect(self, block_num: int, pointers: List[int]) -> None:
+        import struct
+        pointers = list(pointers[:INDIRECT_POINTERS_PER_BLOCK])
+        if len(pointers) < INDIRECT_POINTERS_PER_BLOCK:
+            pointers += [0] * (INDIRECT_POINTERS_PER_BLOCK - len(pointers))
+        self.disk.write_block(block_num, struct.pack(f"<{INDIRECT_POINTERS_PER_BLOCK}I", *pointers))
+
     def _iter_blocks(self, head_inode_num: int) -> List[int]:
-        blocks = []
-        cur_num = head_inode_num
-        seen = set()
-        while cur_num != -1:
-            if cur_num in seen:
-                break  # protecao contra ciclo corrompido
-            seen.add(cur_num)
-            cur = self.read_inode(cur_num)
-            for p in cur.pointers:
-                if p == 0:
-                    break
-                blocks.append(p)
-            cur_num = cur.next_inode
+        inode = self.read_inode(head_inode_num)
+        blocks = [p for p in inode.pointers[:DIRECT_POINTERS] if p != 0]
+        indirect_block = inode.pointers[DIRECT_POINTERS]
+        if indirect_block != 0:
+            blocks.extend(p for p in self._read_indirect(indirect_block) if p != 0)
         return blocks
 
     def _grow(self, head_inode_num: int, needed_blocks: int) -> None:
-        have = len(self._iter_blocks(head_inode_num))
-        to_add = needed_blocks - have
-        if to_add <= 0:
+        blocks = self._iter_blocks(head_inode_num)
+        if needed_blocks <= len(blocks):
+            return
+        if needed_blocks > DIRECT_POINTERS + INDIRECT_POINTERS_PER_BLOCK:
+            raise FSError("arquivo grande demais para um único i-node")
+
+        inode = self.read_inode(head_inode_num)
+        current = len(blocks)
+
+        # Preenche os ponteiros diretos.
+        while current < min(needed_blocks, DIRECT_POINTERS):
+            inode.pointers[current] = self.alloc_block()
+            current += 1
+        self.write_inode(head_inode_num, inode)
+
+        if needed_blocks <= DIRECT_POINTERS:
             return
 
-        cur_num = head_inode_num
-        cur = self.read_inode(cur_num)
-        while cur.next_inode != -1:
-            cur_num = cur.next_inode
-            cur = self.read_inode(cur_num)
+        # A partir daqui, usa um único bloco indireto. O próprio bloco
+        # indireto também ocupa um bloco da área de dados.
+        indirect_block = inode.pointers[DIRECT_POINTERS]
+        if indirect_block == 0:
+            indirect_block = self.alloc_block()
+            inode.pointers[DIRECT_POINTERS] = indirect_block
+            self.write_inode(head_inode_num, inode)
+            indirect = [0] * INDIRECT_POINTERS_PER_BLOCK
+        else:
+            indirect = self._read_indirect(indirect_block)
 
-        used_in_cur = 0
-        for p in cur.pointers:
-            if p == 0:
-                break
-            used_in_cur += 1
-
-        while to_add > 0:
-            if used_in_cur < DIRECT_POINTERS:
-                b = self.alloc_block()
-                cur.pointers[used_in_cur] = b
-                used_in_cur += 1
-                to_add -= 1
-            else:
-                new_num = self.alloc_inode()
-                new_inode = Inode(used=1, type=cur.type)
-                cur.next_inode = new_num
-                self.write_inode(cur_num, cur)  # persiste ponteiros + link para continuacao
-                cur_num, cur = new_num, new_inode
-                used_in_cur = 0
-        self.write_inode(cur_num, cur)
+        indirect_needed = needed_blocks - DIRECT_POINTERS
+        for i in range(indirect_needed):
+            if indirect[i] == 0:
+                indirect[i] = self.alloc_block()
+        self._write_indirect(indirect_block, indirect)
 
     def _shrink(self, head_inode_num: int, needed_blocks: int) -> None:
-        entries = []  # (inode_num, slot, block_num)
-        cur_num = head_inode_num
-        while cur_num != -1:
-            cur = self.read_inode(cur_num)
-            for slot, p in enumerate(cur.pointers):
-                if p == 0:
-                    break
-                entries.append((cur_num, slot, p))
-            cur_num = cur.next_inode
-
-        if len(entries) <= needed_blocks:
+        if needed_blocks < 0:
+            raise FSError("quantidade de blocos inválida")
+        inode = self.read_inode(head_inode_num)
+        current_blocks = self._iter_blocks(head_inode_num)
+        if needed_blocks >= len(current_blocks):
             return
 
-        to_free = entries[needed_blocks:]
-        touched = {}
-        for inode_num, slot, block_num in to_free:
-            self.free_block(block_num)
-            if inode_num not in touched:
-                touched[inode_num] = self.read_inode(inode_num)
-            touched[inode_num].pointers[slot] = 0
-        for inode_num, inode_obj in touched.items():
-            self.write_inode(inode_num, inode_obj)
+        keep_direct = min(needed_blocks, DIRECT_POINTERS)
+        for i in range(keep_direct, DIRECT_POINTERS):
+            if inode.pointers[i] != 0:
+                self.free_block(inode.pointers[i])
+                inode.pointers[i] = 0
 
-        # remove i-nodes de continuacao que ficaram totalmente vazios no final da cadeia
-        cur_num = head_inode_num
-        cur = self.read_inode(cur_num)
-        while cur.next_inode != -1:
-            nxt_num = cur.next_inode
-            nxt = self.read_inode(nxt_num)
-            if all(p == 0 for p in nxt.pointers):
-                cur.next_inode = -1
-                self.write_inode(cur_num, cur)
-                while nxt_num != -1:  # libera nxt e todos os seguintes
-                    after = self.read_inode(nxt_num).next_inode
-                    self.free_inode(nxt_num)
-                    nxt_num = after
-                break
-            cur_num, cur = nxt_num, nxt
+        indirect_block = inode.pointers[DIRECT_POINTERS]
+        if indirect_block != 0:
+            indirect = self._read_indirect(indirect_block)
+            keep_indirect = max(0, needed_blocks - DIRECT_POINTERS)
+            for i in range(keep_indirect, INDIRECT_POINTERS_PER_BLOCK):
+                if indirect[i] != 0:
+                    self.free_block(indirect[i])
+                    indirect[i] = 0
+            if keep_indirect == 0:
+                self.free_block(indirect_block)
+                inode.pointers[DIRECT_POINTERS] = 0
+            else:
+                self._write_indirect(indirect_block, indirect)
+
+        self.write_inode(head_inode_num, inode)
 
     # leitura/escrita do conteudo (usado tambem pro "conteudo" de symlinks,
     # que e so o caminho de destino guardado como bytes)
@@ -419,7 +438,20 @@ class FileSystem:
         if "/" in name:
             raise FSError(f"'{name}': nome não pode conter '/'")
         if len(name.encode("utf-8")) > MAX_NAME_LEN:
-            raise FSError(f"'{name}': nome muito longo (máx. {MAX_NAME_LEN} caracteres)")
+            raise FSError(f"'{name}': nome muito longo (máx. {MAX_NAME_LEN} bytes em UTF-8)")
+
+    @staticmethod
+    def _perm_bits(perm: int, owner: bool) -> int:
+        return (perm >> 3) & 0b111 if owner else perm & 0b111
+
+    def _has_perm(self, inode: Inode, bit: int) -> bool:
+        owner = inode.owner == self.current_user
+        return bool(self._perm_bits(inode.perm, owner) & bit)
+
+    def _require_perm(self, inode_num: int, bit: int, action: str) -> None:
+        inode = self.read_inode(inode_num)
+        if not self._has_perm(inode, bit):
+            raise FSError(f"permissão negada: não é possível {action} '{inode.name}'")
 
     def resolve(self, path: str, cwd_inode: Optional[int] = None,
                 follow_symlink: bool = True, _depth: int = 0) -> int:
@@ -444,6 +476,7 @@ class FileSystem:
             inode = self.read_inode(cur)
             if inode.type != TYPE_DIR:
                 raise FSError(f"{part}: '{inode.name}' não é um diretório")
+            self._require_perm(cur, PERM_X, "atravessar")
             entries = dict(self.read_dir_entries(cur))
             if part not in entries:
                 raise FSError(f"{part}: arquivo ou diretório não encontrado")
@@ -514,10 +547,13 @@ class FileSystem:
 
     def touch(self, path: str) -> int:
         parent, name = self.split_parent(path)
+        self._require_perm(parent, PERM_W, "criar ou modificar")
         existing = dict(self.read_dir_entries(parent))
         if name in existing:
             num = existing[name]
             inode = self.read_inode(num)
+            if not self._has_perm(inode, PERM_W):
+                raise FSError(f"permissão negada: não é possível modificar '{name}'")
             inode.modified_at = time.time()
             self.write_inode(num, inode)
             return num
@@ -535,6 +571,7 @@ class FileSystem:
 
     def write_file(self, path: str, content: bytes, append: bool) -> int:
         parent, name = self.split_parent(path)
+        self._require_perm(parent, PERM_W, "criar ou modificar")
         existing = dict(self.read_dir_entries(parent))
         if name in existing:
             num = existing[name]
@@ -544,6 +581,8 @@ class FileSystem:
                 inode = self.read_inode(num)
             if inode.type == TYPE_DIR:
                 raise FSError(f"{name}: é um diretório")
+            if not self._has_perm(inode, PERM_W):
+                raise FSError(f"permissão negada: não é possível escrever em '{name}'")
         else:
             num = self.touch(path)
 
@@ -558,10 +597,13 @@ class FileSystem:
         inode = self.read_inode(num)
         if inode.type == TYPE_DIR:
             raise FSError(f"{path}: é um diretório")
+        if not self._has_perm(inode, PERM_R):
+            raise FSError(f"permissão negada: não é possível ler '{path}'")
         return self.read_data(num)
 
     def rm(self, path: str) -> None:
         parent, name = self.split_parent(path)
+        self._require_perm(parent, PERM_W, "remover")
         entries = dict(self.read_dir_entries(parent))
         if name not in entries:
             raise FSError(f"{name}: arquivo não encontrado")
@@ -578,6 +620,8 @@ class FileSystem:
         src_inode = self.read_inode(src_num)
         if src_inode.type != TYPE_FILE:
             raise FSError(f"{src}: cp só é suportado para arquivos")
+        if not self._has_perm(src_inode, PERM_R):
+            raise FSError(f"permissão negada: não é possível ler '{src}'")
         data = self.read_data(src_num)
 
         dst_final = dst
@@ -609,6 +653,8 @@ class FileSystem:
         if dst_parent is None:
             dst_parent, dst_name = self.split_parent(dst)
 
+        self._require_perm(src_parent, PERM_W, "mover/remover")
+        self._require_perm(dst_parent, PERM_W, "criar")
         dst_entries = dict(self.read_dir_entries(dst_parent))
         if dst_name in dst_entries:
             raise FSError(f"{dst_name}: já existe")
@@ -630,6 +676,7 @@ class FileSystem:
 
     def ln_s(self, target: str, link_path: str) -> int:
         parent, name = self.split_parent(link_path)
+        self._require_perm(parent, PERM_W, "criar link")
         existing = dict(self.read_dir_entries(parent))
         if name in existing:
             raise FSError(f"{name}: já existe")
@@ -648,6 +695,7 @@ class FileSystem:
     # e daqui pra baixo, diretorio
     def mkdir(self, path: str) -> int:
         parent, name = self.split_parent(path)
+        self._require_perm(parent, PERM_W, "criar diretório")
         existing = dict(self.read_dir_entries(parent))
         if name in existing:
             raise FSError(f"{name}: já existe")
@@ -667,6 +715,7 @@ class FileSystem:
 
     def rmdir(self, path: str) -> None:
         parent, name = self.split_parent(path)
+        self._require_perm(parent, PERM_W, "remover diretório")
         entries = dict(self.read_dir_entries(parent))
         if name not in entries:
             raise FSError(f"{name}: diretório não encontrado")
@@ -689,6 +738,7 @@ class FileSystem:
         inode = self.read_inode(num)
         if inode.type != TYPE_DIR:
             raise FSError(f"{path}: não é um diretório")
+        self._require_perm(num, PERM_R, "listar")
         result = []
         for name, child_num in sorted(self.read_dir_entries(num)):
             if name in (".", ".."):
@@ -702,6 +752,7 @@ class FileSystem:
         inode = self.read_inode(num)
         if inode.type != TYPE_DIR:
             raise FSError(f"{path}: não é um diretório")
+        self._require_perm(num, PERM_X, "entrar em")
         self.cwd_inode = num
 
     def usage(self) -> dict:

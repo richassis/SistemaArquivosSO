@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from fs.constants import (
     DIRENT_FORMAT,
     DIRECT_POINTERS,
+    INODE_POINTERS,
     EMPTY_ENTRY,
     INODE_FORMAT,
     SUPERBLOCK_FORMAT,
@@ -96,13 +97,13 @@ class Inode:
     size: int = 0
     created_at: float = 0.0
     modified_at: float = 0.0
-    pointers: list = field(default_factory=lambda: [0] * DIRECT_POINTERS)
-    next_inode: int = -1
+    # 8 ponteiros diretos + 1 ponteiro para um bloco de ponteiros indiretos.
+    pointers: list = field(default_factory=lambda: [0] * INODE_POINTERS)
 
     def pack(self) -> bytes:
         pointers = list(self.pointers)
-        if len(pointers) < DIRECT_POINTERS:
-            pointers += [0] * (DIRECT_POINTERS - len(pointers))
+        if len(pointers) < INODE_POINTERS:
+            pointers += [0] * (INODE_POINTERS - len(pointers))
         return struct.pack(
             INODE_FORMAT,
             self.used,
@@ -115,8 +116,7 @@ class Inode:
             self.size,
             self.created_at,
             self.modified_at,
-            *pointers[:DIRECT_POINTERS],
-            self.next_inode,
+            *pointers[:INODE_POINTERS],
         )
 
     @classmethod
@@ -125,8 +125,7 @@ class Inode:
         used, type_, perm, _reserved = vals[0:4]
         name_b, creator_b, owner_b = vals[4:7]
         size, created_at, modified_at = vals[7:10]
-        pointers = list(vals[10:10 + DIRECT_POINTERS])
-        next_inode = vals[10 + DIRECT_POINTERS]
+        pointers = list(vals[10:10 + INODE_POINTERS])
         return cls(
             used=used,
             type=type_,
@@ -138,7 +137,6 @@ class Inode:
             created_at=created_at,
             modified_at=modified_at,
             pointers=pointers,
-            next_inode=next_inode,
         )
 
 
