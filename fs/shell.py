@@ -59,7 +59,9 @@ class Shell:
             if not line:
                 continue
             try:
-                tokens = shlex.split(line)
+                lex = shlex.shlex(line, posix=True, punctuation_chars=">")
+                lex.whitespace_split = True
+                tokens = list(lex)
             except ValueError as exc:
                 print(f"erro de sintaxe: {exc}")
                 continue
@@ -134,7 +136,8 @@ class Shell:
                 fs.rmdir(p)
 
         elif cmd == "ls":
-            self._ls(args[0] if args else None)
+            paths = [a for a in args if not a.startswith("-")]  # ignora flags como -l
+            self._ls(paths[0] if paths else None)
 
         elif cmd == "cd":
             fs.cd(args[0] if args else "/")

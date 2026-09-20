@@ -280,9 +280,12 @@ class FileSystem:
             nxt_num = cur.next_inode
             nxt = self.read_inode(nxt_num)
             if all(p == 0 for p in nxt.pointers):
-                self.free_inode(nxt_num)
                 cur.next_inode = -1
                 self.write_inode(cur_num, cur)
+                while nxt_num != -1:  # libera nxt e todos os seguintes
+                    after = self.read_inode(nxt_num).next_inode
+                    self.free_inode(nxt_num)
+                    nxt_num = after
                 break
             cur_num, cur = nxt_num, nxt
 
@@ -536,6 +539,9 @@ class FileSystem:
         if name in existing:
             num = existing[name]
             inode = self.read_inode(num)
+            if inode.type == TYPE_SYMLINK:
+                num = self.resolve(path)  # escreve no destino, nao no link
+                inode = self.read_inode(num)
             if inode.type == TYPE_DIR:
                 raise FSError(f"{name}: é um diretório")
         else:
@@ -671,6 +677,8 @@ class FileSystem:
         contents = [e for e in self.read_dir_entries(num) if e[0] not in (".", "..")]
         if contents:
             raise FSError(f"{name}: diretório não está vazio")
+        if num == self.cwd_inode:
+            raise FSError(f"{name}: é o diretório atual, faça cd para outro lugar antes")
 
         self.remove_dir_entry(parent, name)
         self.free_all_data(num)
