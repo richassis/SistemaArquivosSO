@@ -2,8 +2,8 @@
 # escrita de conteudo, diretorios, links simbolicos e resolucao de
 # caminhos absolutos/relativos.
 #
-# As permissoes do i-node sao aplicadas usando dois grupos: dono e outros.
-# Nao ha grupos de usuarios neste trabalho.
+# O i-node armazena as permissoes de acesso exigidas pelo trabalho.
+# A verificacao de permissoes sera tratada no trabalho de Seguranca.
 
 from __future__ import annotations
 
@@ -31,9 +31,6 @@ from fs.constants import (
     INODE_TABLE_START,
     MAX_NAME_LEN,
     NUM_INODES,
-    PERM_R,
-    PERM_W,
-    PERM_X,
     RESERVED_BLOCKS,
     ROOT_INODE,
     TOTAL_BLOCKS,
@@ -440,19 +437,6 @@ class FileSystem:
         if len(name.encode("utf-8")) > MAX_NAME_LEN:
             raise FSError(f"'{name}': nome muito longo (máx. {MAX_NAME_LEN} bytes em UTF-8)")
 
-    @staticmethod
-    def _perm_bits(perm: int, owner: bool) -> int:
-        return (perm >> 3) & 0b111 if owner else perm & 0b111
-
-    def _has_perm(self, inode: Inode, bit: int) -> bool:
-        owner = inode.owner == self.current_user
-        return bool(self._perm_bits(inode.perm, owner) & bit)
-
-    def _require_perm(self, inode_num: int, bit: int, action: str) -> None:
-        inode = self.read_inode(inode_num)
-        if not self._has_perm(inode, bit):
-            raise FSError(f"permissão negada: não é possível {action} '{inode.name}'")
-
     def resolve(self, path: str, cwd_inode: Optional[int] = None,
                 follow_symlink: bool = True, _depth: int = 0) -> int:
         if _depth > 20:
@@ -476,7 +460,6 @@ class FileSystem:
             inode = self.read_inode(cur)
             if inode.type != TYPE_DIR:
                 raise FSError(f"{part}: '{inode.name}' não é um diretório")
-            self._require_perm(cur, PERM_X, "atravessar")
             entries = dict(self.read_dir_entries(cur))
             if part not in entries:
                 raise FSError(f"{part}: arquivo ou diretório não encontrado")
@@ -547,13 +530,10 @@ class FileSystem:
 
     def touch(self, path: str) -> int:
         parent, name = self.split_parent(path)
-        self._require_perm(parent, PERM_W, "criar ou modificar")
         existing = dict(self.read_dir_entries(parent))
         if name in existing:
             num = existing[name]
             inode = self.read_inode(num)
-            if not self._has_perm(inode, PERM_W):
-                raise FSError(f"permissão negada: não é possível modificar '{name}'")
             inode.modified_at = time.time()
             self.write_inode(num, inode)
             return num
@@ -571,7 +551,6 @@ class FileSystem:
 
     def write_file(self, path: str, content: bytes, append: bool) -> int:
         parent, name = self.split_parent(path)
-        self._require_perm(parent, PERM_W, "criar ou modificar")
         existing = dict(self.read_dir_entries(parent))
         if name in existing:
             num = existing[name]
@@ -581,8 +560,6 @@ class FileSystem:
                 inode = self.read_inode(num)
             if inode.type == TYPE_DIR:
                 raise FSError(f"{name}: é um diretório")
-            if not self._has_perm(inode, PERM_W):
-                raise FSError(f"permissão negada: não é possível escrever em '{name}'")
         else:
             num = self.touch(path)
 
@@ -597,13 +574,10 @@ class FileSystem:
         inode = self.read_inode(num)
         if inode.type == TYPE_DIR:
             raise FSError(f"{path}: é um diretório")
-        if not self._has_perm(inode, PERM_R):
-            raise FSError(f"permissão negada: não é possível ler '{path}'")
         return self.read_data(num)
 
     def rm(self, path: str) -> None:
         parent, name = self.split_parent(path)
-        self._require_perm(parent, PERM_W, "remover")
         entries = dict(self.read_dir_entries(parent))
         if name not in entries:
             raise FSError(f"{name}: arquivo não encontrado")
@@ -620,8 +594,6 @@ class FileSystem:
         src_inode = self.read_inode(src_num)
         if src_inode.type != TYPE_FILE:
             raise FSError(f"{src}: cp só é suportado para arquivos")
-        if not self._has_perm(src_inode, PERM_R):
-            raise FSError(f"permissão negada: não é possível ler '{src}'")
         data = self.read_data(src_num)
 
         dst_final = dst
@@ -653,8 +625,6 @@ class FileSystem:
         if dst_parent is None:
             dst_parent, dst_name = self.split_parent(dst)
 
-        self._require_perm(src_parent, PERM_W, "mover/remover")
-        self._require_perm(dst_parent, PERM_W, "criar")
         dst_entries = dict(self.read_dir_entries(dst_parent))
         if dst_name in dst_entries:
             raise FSError(f"{dst_name}: já existe")
@@ -676,7 +646,6 @@ class FileSystem:
 
     def ln_s(self, target: str, link_path: str) -> int:
         parent, name = self.split_parent(link_path)
-        self._require_perm(parent, PERM_W, "criar link")
         existing = dict(self.read_dir_entries(parent))
         if name in existing:
             raise FSError(f"{name}: já existe")
@@ -695,7 +664,6 @@ class FileSystem:
     # e daqui pra baixo, diretorio
     def mkdir(self, path: str) -> int:
         parent, name = self.split_parent(path)
-        self._require_perm(parent, PERM_W, "criar diretório")
         existing = dict(self.read_dir_entries(parent))
         if name in existing:
             raise FSError(f"{name}: já existe")
@@ -715,7 +683,6 @@ class FileSystem:
 
     def rmdir(self, path: str) -> None:
         parent, name = self.split_parent(path)
-        self._require_perm(parent, PERM_W, "remover diretório")
         entries = dict(self.read_dir_entries(parent))
         if name not in entries:
             raise FSError(f"{name}: diretório não encontrado")
@@ -738,7 +705,6 @@ class FileSystem:
         inode = self.read_inode(num)
         if inode.type != TYPE_DIR:
             raise FSError(f"{path}: não é um diretório")
-        self._require_perm(num, PERM_R, "listar")
         result = []
         for name, child_num in sorted(self.read_dir_entries(num)):
             if name in (".", ".."):
@@ -752,7 +718,6 @@ class FileSystem:
         inode = self.read_inode(num)
         if inode.type != TYPE_DIR:
             raise FSError(f"{path}: não é um diretório")
-        self._require_perm(num, PERM_X, "entrar em")
         self.cwd_inode = num
 
     def usage(self) -> dict:
