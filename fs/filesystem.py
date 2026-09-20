@@ -218,94 +218,132 @@ class FileSystem:
 
     # a partir daqui, funcoes que andam na cadeia de blocos de um i-node
     # (ponteiros diretos + i-node de continuacao, se precisar)
-    def _iter_blocks(self, head_inode_num: int) -> List[int]:
-        blocks = []
-        cur_num = head_inode_num
+    def _chain(self, head_inode_num: int) -> List[Tuple[int, Inode]]:
+        """Devolve [(numero, i-node)] do i-node cabeca e de todas as continuacoes.
+
+        O i-node 0 e sempre a raiz e nunca e continuacao de ninguem, entao
+        next_inode <= 0 encerra a cadeia (-1 = fim normal; 0 = registro que
+        nunca foi inicializado, que num disco zerado le como 0). Tambem para
+        em ciclo ou em i-node marcado como livre (imagem corrompida).
+        """
+        chain: List[Tuple[int, Inode]] = []
         seen = set()
-        while cur_num != -1:
-            if cur_num in seen:
-                break  # protecao contra ciclo corrompido
+        cur_num = head_inode_num
+        while cur_num not in seen:
             seen.add(cur_num)
             cur = self.read_inode(cur_num)
-            for p in cur.pointers:
+            chain.append((cur_num, cur))
+            nxt = cur.next_inode
+            if nxt <= 0 or nxt >= NUM_INODES or not self.inode_bitmap.get(nxt):
+                break
+            cur_num = nxt
+        return chain
+
+    @staticmethod
+    def _used_pointers(inode: Inode) -> int:
+        n = 0
+        for p in inode.pointers:
+            if p == 0:
+                break
+            n += 1
+        return n
+
+    def _iter_blocks(self, head_inode_num: int) -> List[int]:
+        blocks = []
+        for _, ino in self._chain(head_inode_num):
+            for p in ino.pointers:
                 if p == 0:
                     break
                 blocks.append(p)
-            cur_num = cur.next_inode
         return blocks
 
     def _grow(self, head_inode_num: int, needed_blocks: int) -> None:
-        have = len(self._iter_blocks(head_inode_num))
+        """Faz a cadeia ter pelo menos `needed_blocks` blocos.
+
+        Tudo ou nada: se nao houver blocos/i-nodes suficientes (ou se algo
+        falhar no meio), levanta FSError sem deixar nada alocado e sem
+        alterar o que ja estava gravado no disco. As mudancas so vao pro
+        disco depois que tudo foi alocado, e as continuacoes novas sao
+        gravadas ANTES do i-node que aponta pra elas (assim nenhum
+        next_inode aponta pra registro nao inicializado).
+        """
+        chain = self._chain(head_inode_num)
+        have = sum(self._used_pointers(ino) for _, ino in chain)
         to_add = needed_blocks - have
         if to_add <= 0:
             return
 
-        cur_num = head_inode_num
-        cur = self.read_inode(cur_num)
-        while cur.next_inode != -1:
-            cur_num = cur.next_inode
-            cur = self.read_inode(cur_num)
+        last_num, last = chain[-1]
+        used_in_last = self._used_pointers(last)
+        extra = max(0, to_add - (DIRECT_POINTERS - used_in_last))
+        new_inodes_needed = (extra + DIRECT_POINTERS - 1) // DIRECT_POINTERS
+        if self.sb.free_blocks < to_add:
+            raise FSError("disco cheio: sem blocos de dados livres")
+        if self.sb.free_inodes < new_inodes_needed:
+            raise FSError("sem i-nodes livres (limite de arquivos/diretorios atingido)")
 
-        used_in_cur = 0
-        for p in cur.pointers:
-            if p == 0:
-                break
-            used_in_cur += 1
-
-        while to_add > 0:
-            if used_in_cur < DIRECT_POINTERS:
+        new_blocks: List[int] = []
+        fresh: List[Tuple[int, Inode]] = []  # continuacoes criadas agora
+        try:
+            cur_num, cur, used = last_num, last, used_in_last
+            for _ in range(to_add):
+                if used == DIRECT_POINTERS:
+                    new_num = self.alloc_inode()
+                    new_ino = Inode(used=1, type=cur.type)  # next_inode = -1
+                    fresh.append((new_num, new_ino))
+                    cur.next_inode = new_num  # so em memoria por enquanto
+                    cur_num, cur, used = new_num, new_ino, 0
                 b = self.alloc_block()
-                cur.pointers[used_in_cur] = b
-                used_in_cur += 1
-                to_add -= 1
-            else:
-                new_num = self.alloc_inode()
-                new_inode = Inode(used=1, type=cur.type)
-                cur.next_inode = new_num
-                self.write_inode(cur_num, cur)  # persiste ponteiros + link para continuacao
-                cur_num, cur = new_num, new_inode
-                used_in_cur = 0
-        self.write_inode(cur_num, cur)
+                new_blocks.append(b)
+                cur.pointers[used] = b
+                used += 1
+        except FSError:
+            for b in new_blocks:
+                self.free_block(b)
+            for n, _ in fresh:
+                self.free_inode(n)
+            raise
+
+        for n, ino in fresh:
+            self.write_inode(n, ino)
+        self.write_inode(last_num, last)
 
     def _shrink(self, head_inode_num: int, needed_blocks: int) -> None:
-        entries = []  # (inode_num, slot, block_num)
-        cur_num = head_inode_num
-        while cur_num != -1:
-            cur = self.read_inode(cur_num)
-            for slot, p in enumerate(cur.pointers):
+        chain = self._chain(head_inode_num)
+        kept = 0
+        last_keep = 0
+        to_free: List[int] = []
+        changed = set()
+        for idx, (_, ino) in enumerate(chain):
+            for slot in range(DIRECT_POINTERS):
+                p = ino.pointers[slot]
                 if p == 0:
                     break
-                entries.append((cur_num, slot, p))
-            cur_num = cur.next_inode
+                if kept < needed_blocks:
+                    kept += 1
+                    last_keep = idx
+                else:
+                    to_free.append(p)
+                    ino.pointers[slot] = 0
+                    changed.add(idx)
 
-        if len(entries) <= needed_blocks:
+        surplus = chain[last_keep + 1:]  # continuacoes que ficaram vazias
+        if surplus:
+            chain[last_keep][1].next_inode = -1
+            changed.add(last_keep)
+        if not to_free and not surplus:
             return
 
-        to_free = entries[needed_blocks:]
-        touched = {}
-        for inode_num, slot, block_num in to_free:
-            self.free_block(block_num)
-            if inode_num not in touched:
-                touched[inode_num] = self.read_inode(inode_num)
-            touched[inode_num].pointers[slot] = 0
-        for inode_num, inode_obj in touched.items():
-            self.write_inode(inode_num, inode_obj)
-
-        # remove i-nodes de continuacao que ficaram totalmente vazios no final da cadeia
-        cur_num = head_inode_num
-        cur = self.read_inode(cur_num)
-        while cur.next_inode != -1:
-            nxt_num = cur.next_inode
-            nxt = self.read_inode(nxt_num)
-            if all(p == 0 for p in nxt.pointers):
-                cur.next_inode = -1
-                self.write_inode(cur_num, cur)
-                while nxt_num != -1:  # libera nxt e todos os seguintes
-                    after = self.read_inode(nxt_num).next_inode
-                    self.free_inode(nxt_num)
-                    nxt_num = after
-                break
-            cur_num, cur = nxt_num, nxt
+        # grava primeiro os i-nodes que continuam (sem apontar pro que vai
+        # ser liberado) e so depois libera blocos e i-nodes
+        for idx in sorted(changed):
+            if idx <= last_keep:
+                num, ino = chain[idx]
+                self.write_inode(num, ino)
+        for b in to_free:
+            self.free_block(b)
+        for num, _ in surplus:
+            self.free_inode(num)
 
     # leitura/escrita do conteudo (usado tambem pro "conteudo" de symlinks,
     # que e so o caminho de destino guardado como bytes)
@@ -419,6 +457,19 @@ class FileSystem:
                     return
         raise FSError(f"{name}: não encontrado")
 
+    def _set_dir_entry(self, dir_inode_num: int, name: str, target_inode_num: int) -> None:
+        """Troca, no lugar, o i-node para o qual uma entrada existente aponta."""
+        for b in self._iter_blocks(dir_inode_num):
+            data = bytearray(self.disk.read_block(b))
+            for i in range(ENTRIES_PER_BLOCK):
+                raw = bytes(data[i * DIRENT_SIZE:(i + 1) * DIRENT_SIZE])
+                entry = DirEntry.unpack(raw)
+                if entry.inode_num != EMPTY_ENTRY and entry.name == name:
+                    data[i * DIRENT_SIZE:(i + 1) * DIRENT_SIZE] = DirEntry(name, target_inode_num).pack()
+                    self.disk.write_block(b, bytes(data))
+                    return
+        raise FSError(f"{name}: não encontrado")
+
     # so formata o campo perm do i-node pra exibicao (ls/stat) -- sem
     # checagem nenhuma, ver comentario la em cima do arquivo
     @staticmethod
@@ -487,6 +538,10 @@ class FileSystem:
         if name in ("", ".", ".."):
             raise FSError(f"'{path}': nome inválido")
         parent_inode = self.resolve(parent_path)
+        if self.read_inode(parent_inode).type != TYPE_DIR:
+            # sem isso, "touch arq/x" gravava entradas de diretorio dentro
+            # dos blocos de dados de um arquivo comum e o corrompia
+            raise FSError(f"{parent_path}: não é um diretório")
         return parent_inode, name
 
     def path_of(self, inode_num: int) -> str:
@@ -540,6 +595,7 @@ class FileSystem:
             self.write_inode(num, inode)
             return num
 
+        self._check_name(name)  # valida antes de gastar i-node
         num = self.alloc_inode()
         now = time.time()
         inode = Inode(
@@ -548,7 +604,11 @@ class FileSystem:
             size=0, created_at=now, modified_at=now,
         )
         self.write_inode(num, inode)
-        self.add_dir_entry(parent, name, num)
+        try:
+            self.add_dir_entry(parent, name, num)
+        except FSError:
+            self.free_inode(num)  # nao deixa i-node orfao (ex.: disco cheio)
+            raise
         return num
 
     def write_file(self, path: str, content: bytes, append: bool) -> int:
@@ -636,21 +696,24 @@ class FileSystem:
                 raise FSError("não é possível mover um diretório para dentro de si mesmo")
 
         self._check_name(dst_name)
+        # cria a entrada nova ANTES de remover a antiga: se o disco estiver
+        # cheio e o diretorio destino precisar de um bloco novo, falha aqui
+        # sem ter mexido em nada (antes o arquivo podia ficar sem nome).
+        self.add_dir_entry(dst_parent, dst_name, src_num, _validate=False)
         self.remove_dir_entry(src_parent, src_name)
         src_inode.name = dst_name
         src_inode.modified_at = time.time()
         self.write_inode(src_num, src_inode)
-        self.add_dir_entry(dst_parent, dst_name, src_num, _validate=False)
 
         if src_inode.type == TYPE_DIR and dst_parent != src_parent:
-            self.remove_dir_entry(src_num, "..")
-            self.add_dir_entry(src_num, "..", dst_parent, _validate=False)
+            self._set_dir_entry(src_num, "..", dst_parent)
 
     def ln_s(self, target: str, link_path: str) -> int:
         parent, name = self.split_parent(link_path)
         existing = dict(self.read_dir_entries(parent))
         if name in existing:
             raise FSError(f"{name}: já existe")
+        self._check_name(name)
         num = self.alloc_inode()
         now = time.time()
         inode = Inode(
@@ -659,8 +722,13 @@ class FileSystem:
             size=0, created_at=now, modified_at=now,
         )
         self.write_inode(num, inode)
-        self.write_data(num, target.encode("utf-8"))
-        self.add_dir_entry(parent, name, num)
+        try:
+            self.write_data(num, target.encode("utf-8"))
+            self.add_dir_entry(parent, name, num)
+        except FSError:
+            self.free_all_data(num)
+            self.free_inode(num)
+            raise
         return num
 
     # e daqui pra baixo, diretorio
@@ -670,6 +738,7 @@ class FileSystem:
         if name in existing:
             raise FSError(f"{name}: já existe")
 
+        self._check_name(name)
         num = self.alloc_inode()
         now = time.time()
         inode = Inode(
@@ -678,9 +747,15 @@ class FileSystem:
             size=0, created_at=now, modified_at=now,
         )
         self.write_inode(num, inode)
-        self.add_dir_entry(parent, name, num)
-        self.add_dir_entry(num, ".", num, _validate=False)
-        self.add_dir_entry(num, "..", parent, _validate=False)
+        try:
+            # monta o diretorio novo por inteiro e so depois o "pendura" no pai
+            self.add_dir_entry(num, ".", num, _validate=False)
+            self.add_dir_entry(num, "..", parent, _validate=False)
+            self.add_dir_entry(parent, name, num)
+        except FSError:
+            self.free_all_data(num)
+            self.free_inode(num)
+            raise
         return num
 
     def rmdir(self, path: str) -> None:
