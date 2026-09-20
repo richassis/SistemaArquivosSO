@@ -10,7 +10,7 @@
 from __future__ import annotations
 
 import time
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from fs.bitmap import Bitmap
 from fs.constants import (
@@ -51,6 +51,16 @@ class FileSystem:
     def __init__(self, path: str, current_user: str):
         self.path = path
         self.current_user = current_user
+
+        # cache em memoria do conteudo de diretorios ja lidos nesta sessao:
+        # dir_inode -> {nome: (i-node, bloco, slot)}, mais a lista de slots
+        # livres de cada um. Evita reler o diretorio inteiro do disco toda
+        # vez que precisa achar/checar um nome (ver _load_dir_cache). Como
+        # so a gente mesmo escreve no disco.img, da pra manter isso
+        # sincronizado com toda escrita sem se preocupar com outro processo
+        # mexendo por baixo.
+        self._dir_cache: Dict[int, Dict[str, Tuple[int, int, int]]] = {}
+        self._dir_free_slots: Dict[int, List[Tuple[int, int]]] = {}
 
         if not Disk.exists(path):
             Disk.create(path)
@@ -157,6 +167,26 @@ class FileSystem:
             chunk = data[i * BLOCK_SIZE:(i + 1) * BLOCK_SIZE]
             self.disk.write_block(self.sb.block_bitmap_start + i, chunk)
 
+    # versoes que persistem so o bloco do bitmap que contem o bit alterado,
+    # em vez do bitmap inteiro -- usadas em toda alocacao/liberacao de
+    # i-node ou bloco (ver alloc_inode/free_inode/alloc_block/free_block
+    # abaixo). As funcoes acima (_save_inode_bitmap/_save_block_bitmap)
+    # continuam existindo pra escrever o bitmap inteiro de uma vez, usadas
+    # so no mkfs.
+    def _save_inode_bitmap_bit(self, idx: int) -> None:
+        bits_per_block = BLOCK_SIZE * 8
+        block_off = idx // bits_per_block
+        byte_start = block_off * BLOCK_SIZE
+        chunk = bytes(self.inode_bitmap.data[byte_start:byte_start + BLOCK_SIZE])
+        self.disk.write_block(self.sb.inode_bitmap_start + block_off, chunk)
+
+    def _save_block_bitmap_bit(self, idx: int) -> None:
+        bits_per_block = BLOCK_SIZE * 8
+        block_off = idx // bits_per_block
+        byte_start = block_off * BLOCK_SIZE
+        chunk = bytes(self.block_bitmap.data[byte_start:byte_start + BLOCK_SIZE])
+        self.disk.write_block(self.sb.block_bitmap_start + block_off, chunk)
+
     def close(self) -> None:
         self.disk.close()
 
@@ -170,16 +200,22 @@ class FileSystem:
             raise FSError("sem i-nodes livres (limite de arquivos/diretorios atingido)")
         self.inode_bitmap.set(idx, True)
         self.sb.free_inodes -= 1
-        self._save_inode_bitmap()
+        self._save_inode_bitmap_bit(idx)
         self._save_superblock()
         return idx
 
     def free_inode(self, num: int) -> None:
         self.inode_bitmap.set(num, False)
         self.sb.free_inodes += 1
-        self._save_inode_bitmap()
+        self._save_inode_bitmap_bit(num)
         self._save_superblock()
         self.write_inode(num, Inode())
+        # tira do cache se esse numero de i-node ja foi usado como
+        # diretorio -- caso contrario, quando alloc_inode devolver esse
+        # mesmo numero pra um diretorio novo, ele ia aparecer com as
+        # entradas do diretorio antigo
+        self._dir_cache.pop(num, None)
+        self._dir_free_slots.pop(num, None)
 
     def alloc_block(self) -> int:
         idx = self.block_bitmap.find_free(start=DATA_START)
@@ -187,7 +223,7 @@ class FileSystem:
             raise FSError("disco cheio: sem blocos de dados livres")
         self.block_bitmap.set(idx, True)
         self.sb.free_blocks -= 1
-        self._save_block_bitmap()
+        self._save_block_bitmap_bit(idx)
         self._save_superblock()
         return idx
 
@@ -196,7 +232,7 @@ class FileSystem:
             return
         self.block_bitmap.set(num, False)
         self.sb.free_blocks += 1
-        self._save_block_bitmap()
+        self._save_block_bitmap_bit(num)
         self._save_superblock()
 
     def _inode_location(self, num: int) -> Tuple[int, int]:
@@ -387,8 +423,52 @@ class FileSystem:
         self.write_inode(head_inode_num, inode)
 
     def append_data(self, head_inode_num: int, data: bytes) -> None:
-        old = self.read_data(head_inode_num)
-        self.write_data(head_inode_num, old + data)
+        """Acrescenta ao final sem precisar reler o arquivo inteiro e
+        escrever tudo de novo -- so mexe no ultimo bloco (se ele estiver
+        parcialmente cheio) e nos blocos novos que essa escrita precisar.
+        """
+        if not data:
+            return
+        old_size = self.read_inode(head_inode_num).size
+        new_size = old_size + len(data)
+        needed_blocks = (new_size + BLOCK_SIZE - 1) // BLOCK_SIZE
+        current_blocks = len(self._iter_blocks(head_inode_num))
+        if needed_blocks > current_blocks:
+            self._grow(head_inode_num, needed_blocks)
+
+        blocks = self._iter_blocks(head_inode_num)
+        pos_in_block = old_size % BLOCK_SIZE
+        remaining = data
+        for bi in range(old_size // BLOCK_SIZE, len(blocks)):
+            if not remaining:
+                break
+            b = blocks[bi]
+            if pos_in_block > 0:
+                # ultimo bloco existente, parcialmente cheio: preserva o
+                # que ja tinha e so completa a partir de onde parou
+                existing = bytearray(self.disk.read_block(b))
+                space = BLOCK_SIZE - pos_in_block
+                take = remaining[:space]
+                existing[pos_in_block:pos_in_block + len(take)] = take
+                self.disk.write_block(b, bytes(existing))
+                remaining = remaining[len(take):]
+                pos_in_block = 0
+            else:
+                # bloco novo (alocado agora ou reaproveitado): escreve direto
+                chunk = remaining[:BLOCK_SIZE]
+                if len(chunk) < BLOCK_SIZE:
+                    chunk = chunk + b"\x00" * (BLOCK_SIZE - len(chunk))
+                self.disk.write_block(b, chunk)
+                remaining = remaining[BLOCK_SIZE:]
+
+        # le o i-node de novo (so agora, depois do _grow) antes de atualizar
+        # tamanho/data -- se reusasse o objeto lido no inicio da funcao,
+        # essa escrita apagaria os ponteiros novos que o _grow acabou de
+        # gravar no disco
+        inode = self.read_inode(head_inode_num)
+        inode.size = new_size
+        inode.modified_at = time.time()
+        self.write_inode(head_inode_num, inode)
 
     def free_all_data(self, head_inode_num: int) -> None:
         """Libera todos os blocos de dados e i-nodes de continuacao (mas nao o i-node cabeca)."""
@@ -398,36 +478,52 @@ class FileSystem:
         blank = DirEntry.blank().pack()
         self.disk.write_block(block_num, blank * ENTRIES_PER_BLOCK)
 
-    def read_dir_entries(self, dir_inode_num: int) -> List[Tuple[str, int]]:
-        result = []
-        for b in self._iter_blocks(dir_inode_num):
-            data = self.disk.read_block(b)
-            for i in range(ENTRIES_PER_BLOCK):
-                raw = data[i * DIRENT_SIZE:(i + 1) * DIRENT_SIZE]
-                entry = DirEntry.unpack(raw)
-                if entry.inode_num != EMPTY_ENTRY:
-                    result.append((entry.name, entry.inode_num))
-        return result
-
-    def _find_free_dirent_slot(self, dir_inode_num: int) -> Optional[Tuple[int, int]]:
+    def _load_dir_cache(self, dir_inode_num: int) -> Dict[str, Tuple[int, int, int]]:
+        """Devolve o conteudo de um diretorio (nome -> i-node/bloco/slot),
+        lendo do disco so na primeira vez que esse diretorio e acessado
+        nesta sessao -- da segunda vez em diante usa o que ja esta em
+        self._dir_cache. Sem isso, cada touch/mkdir/ln/rm tinha que reler
+        o diretorio inteiro do zero so pra checar se o nome ja existia.
+        """
+        if dir_inode_num in self._dir_cache:
+            return self._dir_cache[dir_inode_num]
+        entries: Dict[str, Tuple[int, int, int]] = {}
+        free_slots: List[Tuple[int, int]] = []
         for b in self._iter_blocks(dir_inode_num):
             data = self.disk.read_block(b)
             for i in range(ENTRIES_PER_BLOCK):
                 raw = data[i * DIRENT_SIZE:(i + 1) * DIRENT_SIZE]
                 entry = DirEntry.unpack(raw)
                 if entry.inode_num == EMPTY_ENTRY:
-                    return b, i
-        return None
+                    free_slots.append((b, i))
+                else:
+                    entries[entry.name] = (entry.inode_num, b, i)
+        self._dir_cache[dir_inode_num] = entries
+        self._dir_free_slots[dir_inode_num] = free_slots
+        return entries
+
+    def _dir_lookup(self, dir_inode_num: int, name: str) -> Optional[int]:
+        # acha o i-node de `name` num diretorio sem montar a lista toda
+        # (usar isso em vez de read_dir_entries()+dict() quando so precisa
+        # de um nome so)
+        info = self._load_dir_cache(dir_inode_num).get(name)
+        return info[0] if info else None
+
+    def read_dir_entries(self, dir_inode_num: int) -> List[Tuple[str, int]]:
+        entries = self._load_dir_cache(dir_inode_num)
+        return [(name, info[0]) for name, info in entries.items()]
 
     def add_dir_entry(self, dir_inode_num: int, name: str, target_inode_num: int, _validate: bool = True) -> None:
+        entries = self._load_dir_cache(dir_inode_num)
         if _validate:
             self._check_name(name)
-            existing = dict(self.read_dir_entries(dir_inode_num))
-            if name in existing:
+            if name in entries:
                 raise FSError(f"{name}: já existe")
 
-        slot = self._find_free_dirent_slot(dir_inode_num)
-        if slot is None:
+        free_slots = self._dir_free_slots[dir_inode_num]
+        if free_slots:
+            block_num, slot_idx = free_slots.pop()
+        else:
             current = len(self._iter_blocks(dir_inode_num))
             self._grow(dir_inode_num, current + 1)
             blocks = self._iter_blocks(dir_inode_num)
@@ -437,38 +533,41 @@ class FileSystem:
             di.size = len(blocks) * BLOCK_SIZE
             di.modified_at = time.time()
             self.write_inode(dir_inode_num, di)
-            slot = (new_block, 0)
+            # o bloco novo tem ENTRIES_PER_BLOCK slots livres; usa o slot 0
+            # agora e guarda o resto pras proximas chamadas (sem isso, cada
+            # add_dir_entry voltaria a varrer o diretorio pra achar o slot)
+            for i in range(1, ENTRIES_PER_BLOCK):
+                free_slots.append((new_block, i))
+            block_num, slot_idx = new_block, 0
 
-        block_num, slot_idx = slot
         data = bytearray(self.disk.read_block(block_num))
         entry = DirEntry(name=name, inode_num=target_inode_num)
         data[slot_idx * DIRENT_SIZE:(slot_idx + 1) * DIRENT_SIZE] = entry.pack()
         self.disk.write_block(block_num, bytes(data))
+        entries[name] = (target_inode_num, block_num, slot_idx)
 
     def remove_dir_entry(self, dir_inode_num: int, name: str) -> None:
-        for b in self._iter_blocks(dir_inode_num):
-            data = bytearray(self.disk.read_block(b))
-            for i in range(ENTRIES_PER_BLOCK):
-                raw = bytes(data[i * DIRENT_SIZE:(i + 1) * DIRENT_SIZE])
-                entry = DirEntry.unpack(raw)
-                if entry.inode_num != EMPTY_ENTRY and entry.name == name:
-                    data[i * DIRENT_SIZE:(i + 1) * DIRENT_SIZE] = DirEntry.blank().pack()
-                    self.disk.write_block(b, bytes(data))
-                    return
-        raise FSError(f"{name}: não encontrado")
+        entries = self._load_dir_cache(dir_inode_num)
+        info = entries.pop(name, None)
+        if info is None:
+            raise FSError(f"{name}: não encontrado")
+        _, block_num, slot_idx = info
+        data = bytearray(self.disk.read_block(block_num))
+        data[slot_idx * DIRENT_SIZE:(slot_idx + 1) * DIRENT_SIZE] = DirEntry.blank().pack()
+        self.disk.write_block(block_num, bytes(data))
+        self._dir_free_slots[dir_inode_num].append((block_num, slot_idx))
 
     def _set_dir_entry(self, dir_inode_num: int, name: str, target_inode_num: int) -> None:
         """Troca, no lugar, o i-node para o qual uma entrada existente aponta."""
-        for b in self._iter_blocks(dir_inode_num):
-            data = bytearray(self.disk.read_block(b))
-            for i in range(ENTRIES_PER_BLOCK):
-                raw = bytes(data[i * DIRENT_SIZE:(i + 1) * DIRENT_SIZE])
-                entry = DirEntry.unpack(raw)
-                if entry.inode_num != EMPTY_ENTRY and entry.name == name:
-                    data[i * DIRENT_SIZE:(i + 1) * DIRENT_SIZE] = DirEntry(name, target_inode_num).pack()
-                    self.disk.write_block(b, bytes(data))
-                    return
-        raise FSError(f"{name}: não encontrado")
+        entries = self._load_dir_cache(dir_inode_num)
+        info = entries.get(name)
+        if info is None:
+            raise FSError(f"{name}: não encontrado")
+        _, block_num, slot_idx = info
+        data = bytearray(self.disk.read_block(block_num))
+        data[slot_idx * DIRENT_SIZE:(slot_idx + 1) * DIRENT_SIZE] = DirEntry(name, target_inode_num).pack()
+        self.disk.write_block(block_num, bytes(data))
+        entries[name] = (target_inode_num, block_num, slot_idx)
 
     # so formata o campo perm do i-node pra exibicao (ls/stat) -- sem
     # checagem nenhuma, ver comentario la em cima do arquivo
@@ -513,10 +612,9 @@ class FileSystem:
             inode = self.read_inode(cur)
             if inode.type != TYPE_DIR:
                 raise FSError(f"{part}: '{inode.name}' não é um diretório")
-            entries = dict(self.read_dir_entries(cur))
-            if part not in entries:
+            target = self._dir_lookup(cur, part)
+            if target is None:
                 raise FSError(f"{part}: arquivo ou diretório não encontrado")
-            target = entries[part]
             target_inode = self.read_inode(target)
             if target_inode.type == TYPE_SYMLINK and (follow_symlink or not is_last):
                 link_path = self.read_data(target).decode("utf-8", errors="replace")
@@ -587,9 +685,8 @@ class FileSystem:
 
     def touch(self, path: str) -> int:
         parent, name = self.split_parent(path)
-        existing = dict(self.read_dir_entries(parent))
-        if name in existing:
-            num = existing[name]
+        num = self._dir_lookup(parent, name)
+        if num is not None:
             inode = self.read_inode(num)
             inode.modified_at = time.time()
             self.write_inode(num, inode)
@@ -613,9 +710,8 @@ class FileSystem:
 
     def write_file(self, path: str, content: bytes, append: bool) -> int:
         parent, name = self.split_parent(path)
-        existing = dict(self.read_dir_entries(parent))
-        if name in existing:
-            num = existing[name]
+        num = self._dir_lookup(parent, name)
+        if num is not None:
             inode = self.read_inode(num)
             if inode.type == TYPE_SYMLINK:
                 num = self.resolve(path)  # escreve no destino, nao no link
@@ -640,10 +736,9 @@ class FileSystem:
 
     def rm(self, path: str) -> None:
         parent, name = self.split_parent(path)
-        entries = dict(self.read_dir_entries(parent))
-        if name not in entries:
+        num = self._dir_lookup(parent, name)
+        if num is None:
             raise FSError(f"{name}: arquivo não encontrado")
-        num = entries[name]
         inode = self.read_inode(num)
         if inode.type == TYPE_DIR:
             raise FSError(f"{name}: é um diretório (use rmdir)")
@@ -671,10 +766,9 @@ class FileSystem:
 
     def mv(self, src: str, dst: str) -> None:
         src_parent, src_name = self.split_parent(src)
-        src_entries = dict(self.read_dir_entries(src_parent))
-        if src_name not in src_entries:
+        src_num = self._dir_lookup(src_parent, src_name)
+        if src_num is None:
             raise FSError(f"{src_name}: não encontrado")
-        src_num = src_entries[src_name]
         src_inode = self.read_inode(src_num)
 
         dst_parent, dst_name = None, None
@@ -687,8 +781,7 @@ class FileSystem:
         if dst_parent is None:
             dst_parent, dst_name = self.split_parent(dst)
 
-        dst_entries = dict(self.read_dir_entries(dst_parent))
-        if dst_name in dst_entries:
+        if self._dir_lookup(dst_parent, dst_name) is not None:
             raise FSError(f"{dst_name}: já existe")
 
         if src_inode.type == TYPE_DIR:
@@ -710,8 +803,7 @@ class FileSystem:
 
     def ln_s(self, target: str, link_path: str) -> int:
         parent, name = self.split_parent(link_path)
-        existing = dict(self.read_dir_entries(parent))
-        if name in existing:
+        if self._dir_lookup(parent, name) is not None:
             raise FSError(f"{name}: já existe")
         self._check_name(name)
         num = self.alloc_inode()
@@ -734,8 +826,7 @@ class FileSystem:
     # e daqui pra baixo, diretorio
     def mkdir(self, path: str) -> int:
         parent, name = self.split_parent(path)
-        existing = dict(self.read_dir_entries(parent))
-        if name in existing:
+        if self._dir_lookup(parent, name) is not None:
             raise FSError(f"{name}: já existe")
 
         self._check_name(name)
@@ -760,10 +851,9 @@ class FileSystem:
 
     def rmdir(self, path: str) -> None:
         parent, name = self.split_parent(path)
-        entries = dict(self.read_dir_entries(parent))
-        if name not in entries:
+        num = self._dir_lookup(parent, name)
+        if num is None:
             raise FSError(f"{name}: diretório não encontrado")
-        num = entries[name]
         inode = self.read_inode(num)
         if inode.type != TYPE_DIR:
             raise FSError(f"{name}: não é um diretório")
